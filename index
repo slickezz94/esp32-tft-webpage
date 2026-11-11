@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enviar imagen a la TFT</title>
+<style>
+  body { font-family: sans-serif; max-width: 420px; margin: 0 auto; padding: 20px; text-align: center; }
+  button { font-size: 16px; padding: 10px 18px; margin: 6px; }
+  canvas { border: 1px solid #888; image-rendering: pixelated; width: 256px; height: 320px; }
+  #log { font-size: 14px; color: #444; min-height: 1.5em; }
+  label { display: block; margin: 8px 0; }
+</style>
+</head>
+<body>
+<h3>Enviar imagen a la TFT por Bluetooth</h3>
+
+<button id="btnConnect">1. Conectar al ESP32</button><br>
+<input type="file" id="file" accept="image/*"><br>
+<label>Ajuste:
+  <select id="mode">
+    <option value="cover">Llenar pantalla (recorta)</option>
+    <option value="contain">Imagen completa (bordes negros)</option>
+    <option value="stretch">Estirar</option>
+  </select>
+</label>
+<canvas id="c" width="128" height="160"></canvas><br>
+<button id="btnSend" disabled>2. Enviar a la pantalla</button>
+<p id="log">Sin conectar</p>
+
+<script>
+const SERVICE = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+const CHAR    = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+const W = 128, H = 160;
+const CHUNK = 180;   // si falla el envío, baja a 100 o incluso 19
+
+const c = document.getElementById('c');
+const ctx = c.getContext('2d', { willReadFrequently: true });
+const log = t => document.getElementById('log').textContent = t;
+let img = null, characteristic = null;
+
+function draw() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  if (!img) return;
+  const mode = document.getElementById('mode').value;
+  if (mode === 'stretch') {
+    ctx.drawImage(img, 0, 0, W, H);
+    return;
+  }
+  const r = mode === 'cover'
+    ? Math.max(W / img.width, H / img.height)
+    : Math.min(W / img.width, H / img.height);
+  const w = img.width * r, h = img.height * r;
+  ctx.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);
+}
+
+document.getElementById('file').onchange = e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const i = new Image();
+  i.onload = () => { img = i; draw(); updateButtons(); };
+  i.src = URL.createObjectURL(f);
+};
+document.getElementById('mode').onchange = draw;
+
+function updateButtons() {
+  document.getElementById('btnSend').disabled = !(img && characteristic);
+}
+
+document.getElementById('btnConnect').onclick = async () => {
+  if (!navigator.bluetooth) {
+    log('Este navegador no soporta Web Bluetooth. Usa Chrome en Android o PC (en iPhone, la app Bluefy).');
+    return;
+  }
+  try {
+    log('Buscando...');
+    const dev = await navigator.bluetooth.requestDevice({
+      filters: [{ name: 'ESP32-TFT' }],
+      optionalServices: [SERVICE]
+    });
+    dev.addEventListener('gattserverdisconnected', () => {
+      characteristic = null; updateButtons(); log('Desconectado');
+    });
+    const server = await dev.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE);
+    characteristic = await service.getCharacteristic(CHAR);
+    log('Conectado a ' + dev.name);
+    updateButtons();
+  } catch (err) {
+    log('Error: ' + err.message);
+  }
+};
+
+function toRGB565() {
+  const d = ctx.getImageData(0, 0, W, H).data;
+  const out = new Uint8Array(W * H * 2);
+  for (let i = 0, j = 0; i < d.length; i += 4, j += 2) {
+    const v = ((d[i] & 0xF8) << 8) | ((d[i + 1] & 0xFC) << 3) | (d[i + 2] >> 3);
+    out[j] = v >> 8;      // byte alto primero
+    out[j + 1] = v & 0xFF;
+  }
+  return out;
+}
+
+async function write(bytes) {
+  for (let tries = 0; ; tries++) {
+    try {
+      if (characteristic.writeValueWithoutResponse) await characteristic.writeValueWithoutResponse(bytes);
+      else await characteristic.writeValue(bytes);
+      return;
+    } catch (e) {
+      if (tries > 5) throw e;
+      await new Promise(r => setTimeout(r, 20));
+    }
+  }
+}
+
+document.getElementById('btnSend').onclick = async () => {
+  if (!characteristic || !img) return;
+  const btn = document.getElementById('btnSend');
+  btn.disabled = true;
+  try {
+    const data = toRGB565();
+    await write(new Uint8Array([0]));
+    for (let off = 0; off < data.length; off += CHUNK) {
+      const part = data.subarray(off, off + CHUNK);
+      const pkt = new Uint8Array(part.length + 1);
+      pkt[0] = 1;
+      pkt.set(part, 1);
+      await write(pkt);
+      log('Enviando ' + Math.round(100 * off / data.length) + '%');
+    }
+    await write(new Uint8Array([2]));
+    log('Imagen enviada');
+  } catch (err) {
+    log('Error al enviar: ' + err.message);
+  }
+  btn.disabled = false;
+};
+</script>
+</body>
+</html>
